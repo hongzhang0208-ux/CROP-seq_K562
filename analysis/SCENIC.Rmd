@@ -1,0 +1,422 @@
+---
+title: "CROP-seq_SCENIC"
+output: html_notebook
+---
+# 1. Basic setting and input
+## Setup packages
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Suppress loading messages when building the HTML
+suppressPackageStartupMessages({
+  library(SCENIC)
+  library(AUCell)
+  library(RcisTarget)
+  library(SCopeLoomR)
+  library(KernSmooth)
+  library(BiocParallel)
+  library(ggplot2)
+  library(data.table)
+  library(grid)
+  library(ComplexHeatmap)
+  library(Seurat)
+})
+
+options(width=200)
+```
+
+## Formatting input loom file
+```{r}
+# Read the RDS file after Mixscape identification.
+seurat.obj <- readRDS("seurat.obj.RDS")
+Idents(seurat.obj) <- "NT"
+cellInfo <- data.frame(seuratCluster=Idents(seurat.obj))
+exprMat <- seurat.obj@assays$RNA@counts
+colnames(cellInfo) <- "CellType"
+
+# Forming loom file.
+dir.create("data")
+loom <- build_loom("data/CROPseq.loom", dgem=exprMat)
+loom <- add_cell_annotation(loom, cellInfo)
+close_loom(loom)
+```
+
+## Cell_info/ group by sgRNAs
+```{r cellInfo}
+# cellInfo$nGene <- colSums(exprMat>0)
+head(cellInfo)
+cellInfo <- data.frame(cellInfo)
+cbind(table(cellInfo$CellType))
+dir.create("int")
+saveRDS(cellInfo, file="int/cellInfo.Rds")
+```
+
+## Cell_info_2 / group by KD and NP
+```{r}
+library(dplyr)
+library(readxl)
+
+# Ensure that the column names of the mapping table 'Book' are correct
+Book <- read_excel("book.xlsx")
+colnames(Book) <- c("NT", "mixscape_class.global", "Info")
+
+# Extract Seurat meta.data and temporarily store cell barcodes as a column
+meta_data <- seurat.obj@meta.data
+meta_data$cell_id <- rownames(meta_data)  # preserve original row names (cell IDs)
+
+# Perform a left join to merge the 'Info' column from 'Book' into meta_data
+# based on NT status and mixscape classification
+meta_data <- left_join(meta_data, Book, by = c("NT", "mixscape_class.global"))
+
+# Rename the merged 'Info' column to a more descriptive name
+meta_data <- meta_data %>%
+  rename(CellInfo_2 = Info)
+
+# Restore cell IDs as row names and remove the temporary column
+rownames(meta_data) <- meta_data$cell_id
+meta_data$cell_id <- NULL
+
+# Update the Seurat object's meta.data with the merged annotation
+seurat.obj@meta.data <- meta_data
+
+# Set cell identities based on the new CellInfo_2 annotation
+Idents(seurat.obj) <- "CellInfo_2"
+
+# Export cell identity information as an RDS file for downstream analysis
+cellInfo_2 <- data.frame(CellType = Idents(seurat.obj))
+saveRDS(cellInfo_2, file = "int/cellInfo_2.Rds")
+saveRDS(seurat.obj,file = "seurat.obj_2.RDS")
+```
+
+## Initialize SCENIC settings / scenicOptions
+```{r chooseOrg}
+data(list="motifAnnotations_hgnc_v9", package="RcisTarget")
+motifAnnotations_hgnc <- motifAnnotations_hgnc_v9 # To load a available and readable motif file.
+scenicOptions <- initializeScenic(org='hgnc',
+                                datasetTitle='SCENIC for CROP-seq', 
+                                nCores=5, # can't be too high
+                                dbDir = 'cisTarget_databases',
+                                dbs = list(
+  '500bp'= 'hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather',  
+  '10kb' = 'hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather')) 
+#hgnc:human.
+
+# Modify if needed
+scenicOptions@inputDatasetInfo$cellInfo <- "int/cellInfo.Rds"
+scenicOptions@inputDatasetInfo$colVars <- "int/colVars.Rds"
+scenicOptions@settings$seed <- 123
+
+# Save to use at a later time...
+saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+```
+
+
+# 2. Co-expression network
+## Open the loom file, load the expression matrix and program setting
+```{r loom} 
+loom <- open_loom("data/CROPseq.loom")
+exprMat <- get_dgem(loom)
+cellInfo <- get_cell_annotation(loom)
+close_loom(loom)
+
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+```
+
+## Gene filter/selection
+```{r filterGenes, results="hold"}
+# (Adjust minimum values according to your dataset)
+genesKept <- geneFiltering(exprMat, scenicOptions=scenicOptions,
+                           minCountsPerGene=3*.01*ncol(exprMat),
+                           minSamples=ncol(exprMat)*.01)
+
+# Before proceeding to the network inference, check whether any known relevant genes are filtered-out (if any relevant gene is missing, double-check whether the filters are appropiate)
+# interestingGenes <- c("Sox9", "Sox10", "Dlx5")
+# interestingGenes[which(!interestingGenes %in% genesKept)] # any missing?
+
+# Filter the expression matrix
+exprMat_filtered <- exprMat[genesKept, ]
+```
+
+## Correlation (can be run before/after/at the same time of GENIE3)
+To know the correlation from GENIE3 is positive or negative. Using the "cor" function.
+```{r correlationMat, eval=FALSE}
+runCorrelation(exprMat_filtered, scenicOptions)
+```
+
+## GENIE3 
+```{r genie3, eval=TRUE, results="hold"}
+# Optional: add log (if it is not logged/normalized already)
+exprMat_filtered <- log2(exprMat_filtered+1) 
+
+# Run GENIE3
+runGenie3(exprMat_filtered, scenicOptions)
+```
+
+
+# 3. Get modules, regulons and score the GRN
+This step will typically take several days to run.
+```{r runScenicWrapper, eval=FALSE}
+# Optional: log expression (for TF expression plot, it does not affect any other calculation)
+exprMat_log <- log2(exprMat+1) # Not exprMat_filtered!
+
+# There would be errors Without this.
+data(list="motifAnnotations_hgnc_v9", package="RcisTarget")
+motifAnnotations_hgnc <- motifAnnotations_hgnc_v9
+
+scenicOptions <- runSCENIC_1_coexNetwork2modules(scenicOptions)
+scenicOptions <- runSCENIC_2_createRegulons(scenicOptions)
+scenicOptions <- runSCENIC_3_scoreCells(scenicOptions, exprMat_log)
+
+saveRDS(scenicOptions, file="int/scenicOptions.Rds") # To save status in case any changes.
+```
+
+
+# 4. Clustering / dimensionality reduction on the regulon activity
+The function included in SCENIC package runs multiple t-SNEs with different settings; It will create all combinations between the selected "number of PCs" and "perplexity":
+```{r}
+nPcs <- c(5,15,50)
+
+# Run t-SNE with different settings:
+fileNames <- tsneAUC(scenicOptions, aucType="AUC", nPcs=nPcs, perpl=c(5,15,50))
+fileNames <- tsneAUC(scenicOptions, aucType="AUC", nPcs=nPcs, perpl=c(5,15,50), onlyHighConf=TRUE, filePrefix="int/tSNE_oHC")
+# Plot as pdf (individual files in int/):
+fileNames <- paste0("int/",grep(".Rds", grep("tSNE_", list.files("int"), value=T), value=T))
+```
+
+```{r altTsnesPlotShown, eval=TRUE, fig.height=9, fig.width=8}
+par(mfrow=c(3, 3))
+fileNames <- paste0("int/",grep(".Rds", grep("tSNE_AUC", list.files("int"), value=T, perl = T), value=T))
+plotTsne_compareSettings(fileNames, scenicOptions, showLegend=FALSE, varName="CellType", cex=.5)
+```
+
+```{r altTsnesPlot_oHC, eval=True, fig.height=9, fig.width=8}
+# Using only "high-confidence" regulons (normally similar)
+par(mfrow=c(3,3))
+fileNames <- paste0("int/",grep(".Rds", grep("tSNE_oHC_AUC", list.files("int"), value=T, perl = T), value=T))
+plotTsne_compareSettings(fileNames, scenicOptions, showLegend=FALSE, varName="CellType", cex=.5)
+```
+
+The chosen t-SNE can then be saved as default to use for plots:
+```{r changeDefaultTsne}
+scenicOptions@settings$defaultTsne$aucType <- "AUC"
+scenicOptions@settings$defaultTsne$dims <- 50
+scenicOptions@settings$defaultTsne$perpl <- 50
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+
+# 5. Export to loom/SCope
+```{r eval=FALSE}
+# DGEM (Digital gene expression matrix)
+# (non-normalized counts)
+exprMat <- get_dgem(open_loom("data/CROPseq.loom"))
+dgem <- exprMat
+head(colnames(dgem))  #should contain the Cell ID/name
+
+# Export:
+scenicOptions@fileNames$output["loomFile",] <- "output/CROPseq_SCENIC.loom"
+export2loom(scenicOptions, exprMat)
+```
+
+
+# 6. Loading results from a .loom file
+`SCopeLoomR` also provides functions to import the regulons, AUC, and embeddings back from the loom file. e.g.:
+```{r readLoom, eval=FALSE}
+library(SCopeLoomR)
+loom <- open_loom("output/CROPseq_SCENIC.loom")
+
+# Read information from loom file:
+regulons_incidMat <- get_regulons(loom)
+regulons <- regulonsToGeneLists(regulons_incidMat)
+regulonsAUC <- get_regulons_AUC(loom)
+regulonsAucThresholds <- get_regulon_thresholds(loom)
+embeddings <- get_embeddings(loom)
+```
+
+## Exploring/interpreting the results: Check related genes in the regulons
+```{r seeRegulons}
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+regulons <- loadInt(scenicOptions, "regulons")
+regulons[c("MYB", "GATA2","LMO2")]
+```
+
+
+# 7. RAC heatmap of high confident regulons (remove all the regulons with "_extended")
+## Load scenicoptions, cell information and AUC
+```{r}
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+cellInfo <- readRDS("int/cellInfo.Rds")
+cellInfo_2 <- readRDS("int/cellInfo_2.Rds")
+regulonAUC <- loadInt(scenicOptions, "aucell_regulonAUC")
+regulonAUC <- regulonAUC[grep("_extended",rownames(regulonAUC),invert=T, value=T),] # Remove low quality regulons
+```
+
+## Up-regulated regulons. gRNA and gene level.
+```{r}
+## gRNA level
+# Regulators for known clusters, only keep high confident regulons
+regulonActivity_byCellType <- sapply(split(rownames(cellInfo), cellInfo$CellType),
+                                     function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+regulonActivity_byCellType_Scaled <- t(scale(t(regulonActivity_byCellType), center = T, scale=T))
+
+ComplexHeatmap::Heatmap(regulonActivity_byCellType_Scaled, name="Regulon activity",row_names_gp = gpar(fontsize = 4), column_names_rot = 45)
+
+# Cell-type specific regulators (based on the Regulon Specificity Score (RSS))
+rss <- calcRSS(AUC=getAUC(regulonAUC), cellAnnotation=cellInfo[colnames(regulonAUC), "CellType"])
+rssPlot$plot <- rssPlot$plot + theme(axis.text.x = element_text(angle = 0, hjust = 1))
+plotly::ggplotly(rssPlot$plot)
+
+
+## gene level
+regulonActivity_byCellType <- sapply(split(rownames(cellInfo_2), cellInfo_2$CellType),
+                                     function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+regulonActivity_byCellType_Scaled <- t(scale(t(regulonActivity_byCellType), center = T, scale=T))
+
+ComplexHeatmap::Heatmap(regulonActivity_byCellType_Scaled, name="Regulon activity",row_names_gp = gpar(fontsize = 4), column_names_rot = 45)
+
+# Cell-type specific regulators (based on the Regulon Specificity Score (RSS))
+rss <- calcRSS(AUC=getAUC(regulonAUC), cellAnnotation=cellInfo_2[colnames(regulonAUC), "CellType"])
+rssPlot$plot <- rssPlot$plot + theme(axis.text.x = element_text(angle = 0, hjust = 1)) # Can add zThreshold = 0 to show more 
+plotly::ggplotly(rssPlot$plot)
+ggsave("rssPlot.pdf", plot = rssPlot$plot, width = 8, height = 6)
+```
+
+## Down-regulated regulons (with at least one RAC value < -1). Gene level.
+```{r}
+library(dplyr)
+regulonActivity_byCellType <- sapply(split(rownames(cellInfo_2), cellInfo_2$CellType),
+                                     function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+regulonActivity_byCellType_Scaled <- t(scale(t(regulonActivity_byCellType), center = T, scale=T))
+
+# Extract regulon names with at least one RAC value < -1
+MYB <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "MYB KD"] < -1]
+GATA2 <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "GATA2 KD"] < -1]
+LMO2 <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "LMO2 KD"] < -1]
+regulons <- c(MYB,GATA2,LMO2)
+regulons <- unique(regulons)
+
+# Form heatmap
+RAC <- regulonActivity_byCellType[rownames(regulonActivity_byCellType) %in% regulons,]
+RAC_Scaled <- t(scale(t(RAC), center = T, scale=T))
+ComplexHeatmap::Heatmap(RAC_Scaled, name="Regulon activity",row_names_gp = gpar(fontsize = 10), column_names_rot = 45)
+```
+
+## RSS heatmap of high confident regulons
+```{r}
+rss <- calcRSS(AUC=getAUC(regulonAUC), cellAnnotation=cellInfo_2[colnames(regulonAUC), "CellType"])
+rssNorm <- scale(rss)
+ComplexHeatmap::Heatmap(rssNorm, name="Regulon specificity",row_names_gp = gpar(fontsize = 4), column_names_rot = 45)
+```
+
+
+# 8. Select regulons to produce GRNs based on RAC and RSS
+## Load seurat object
+```{r}
+seurat.obj <- readRDS("seurat.obj_2.RDS")
+DefaultAssay(seurat.obj) <- "RNA"
+Idents(seurat.obj) <- "gene"
+
+MYB.obj <- subset(seurat.obj, subset= CellInfo_2=="NT"|CellInfo_2== "MYB KD")
+LMO2.obj <- subset(seurat.obj, subset= CellInfo_2=="NT"|CellInfo_2== "LMO2 KD")
+GATA2.obj <- subset(seurat.obj, subset= CellInfo_2=="NT"|CellInfo_2== "GATA2 KD")
+```
+
+## Calculate FC for TFs to positive regulons (Z score > 1)
+```{r}
+# Select regulons with RSS score > 0.5 for each cluster
+rss <- calcRSS(AUC=getAUC(regulonAUC), cellAnnotation=cellInfo_2[colnames(regulonAUC), "CellType"])
+rssNorm <- scale(rss)
+MYB <- gsub("\\s*\\(.*?\\)", "", rownames(rssNorm[rssNorm[,"MYB KD"]>1,]))
+LMO2 <-  gsub("\\s*\\(.*?\\)", "", rownames(rssNorm[rssNorm[,"LMO2 KD"]>1,]))
+GATA2 <- gsub("\\s*\\(.*?\\)", "", rownames(rssNorm[rssNorm[,"GATA2 KD"]>1,]))
+
+TF <- c()
+for(i in MYB){
+    temp <- FindMarkers(MYB.obj, ident.1="MYB", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("MYB_",i)
+    TF <- rbind(TF,temp)
+}
+
+for(i in GATA2){
+    temp <- FindMarkers(GATA2.obj, ident.1="GATA2", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("GATA2_",i)
+    TF <- rbind(TF,temp)
+}
+
+for(i in LMO2){
+    temp <- FindMarkers(LMO2.obj, ident.1="LMO2", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("LMO2_",i)
+    TF <- rbind(TF,temp)
+}
+write.csv(TF,file = paste("FC of TF for each regulon_positive",".csv",sep = ""))
+```
+
+## Calculate FC for TFs to Negative regulons (RAC score < -1): 
+```{r}
+# Pick regulons in scaled RAC file with at least one value < -1 in either MYB KD, GATA2 KD or LMO2 KD.
+regulonActivity_byCellType <- sapply(split(rownames(cellInfo_2), cellInfo_2$CellType),
+                                     function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+regulonActivity_byCellType_Scaled <- t(scale(t(regulonActivity_byCellType), center = T, scale=T))
+
+# Extract regulon names with at least one RAC value < -1
+MYB <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "MYB KD"] < -1]
+GATA2 <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "GATA2 KD"] < -1]
+LMO2 <- rownames(regulonActivity_byCellType_Scaled)[regulonActivity_byCellType_Scaled[, "LMO2 KD"] < -1]
+regulons <- c(MYB,GATA2,LMO2)
+regulons <- unique(regulons)
+regulons <-  gsub("\\s*\\(.*?\\)", "", regulons)
+
+TF <- c()
+for(i in regulons){
+    temp <- FindMarkers(MYB.obj, ident.1="MYB", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("MYB_",i)
+    TF <- rbind(TF,temp)
+}
+
+for(i in regulons){
+    temp <- FindMarkers(GATA2.obj, ident.1="GATA2", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("GATA2_",i)
+    TF <- rbind(TF,temp)
+}
+
+for(i in regulons){
+    temp <- FindMarkers(LMO2.obj, ident.1="LMO2", ident.2="NT", features = i, pseudocount.use = 1e-9, logfc.threshold = 1e-9,min.pct = 1e-9)
+    rownames(temp) <- paste("LMO2_",i)
+    TF <- rbind(TF,temp)
+}
+write.csv(TF,file = paste("FC of TF for each regulon_negative",".csv",sep = ""))
+```
+
+
+# 9. Calculate DEGs for all the genes in the selected regulons
+```{r}
+library(DESeq2)
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+regulons <- loadInt(scenicOptions, "regulons")
+
+LMO2_regulons <- c("GATA1","KLF1","DLX1","ATF6B","RELB","IRF1","IRF7","STAT2","STAT6","MYC","TCF7L2","FOXP1","TEAD1","PITX1","CTCFL","TFDP1","LMO2","HMGA1")
+GATA2_regulons <- c("GATA1","KLF1","DLX1","ATF6B","RELB","IRF1","IRF7","STAT2","STAT6","MYC","CREB3","GATA2","E2F7","CTCF")
+MYB_regulons <- c("CREB3","GATA2","MYC","CREB3L2","MYB","TAL1","EGR1")
+
+LMO2 <- c()
+for(i in LMO2_regulons){
+    temp <- FindMarkers(LMO2.obj, ident.1="LMO2", ident.2="NT", features = unlist(regulons[i]),test.use = "DESeq2", logfc.threshold = 1e-9,min.pct = 1e-9)
+    temp$Gene <- rownames(temp)
+    temp$Regulon <- i
+    LMO2 <- rbind(LMO2,temp)
+}
+
+GATA2 <- c()
+for(i in GATA2_regulons){
+    temp <- FindMarkers(GATA2.obj, ident.1="GATA2", ident.2="NT", features = unlist(regulons[i]),test.use = "DESeq2", logfc.threshold = 1e-9,min.pct = 1e-9)
+    temp$Gene <- rownames(temp)
+    temp$Regulon <- i
+    GATA2 <- rbind(GATA2,temp)
+}
+
+MYB <- c()
+for(i in MYB_regulons){
+    temp <- FindMarkers(MYB.obj, ident.1="MYB", ident.2="NT", features = unlist(regulons[i]), test.use = "DESeq2", logfc.threshold = 1e-9,min.pct = 1e-9)
+    temp$Gene <- rownames(temp)
+    temp$Regulon <- i
+    MYB <- rbind(MYB,temp)
+}
+```
