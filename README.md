@@ -24,7 +24,7 @@ The pipeline includes:
 
 ## Repository Structure
 
-- `analysis/`: R Markdown files for Mixscape and SCENIC analyses
+- `analysis/`: R Markdown files for Mixscape and SCENIC analysis
 - `data/`: Input annotation files (e.g. sgRNA-to-gene mapping)
 - `env/`: R session information for reproducibility
 
